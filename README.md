@@ -114,7 +114,3 @@ Free model IDs (ending in `:free`) change over time — see the current list at
 - **403 in logs** → webhook secret mismatch; re-run **Register webhook** from `/setup`
 - **"All free models rate-limited"** → you hit OpenRouter's daily free quota; wait
   for reset or add the one-time $10 credit
-
-## 📄 License
-
-MIT — fork it, ship it, make it yours.
