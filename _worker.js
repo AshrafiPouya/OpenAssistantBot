@@ -56,9 +56,24 @@ export default {
 
     const cfg = await loadConfig(env);
 
-    // --- Setup dashboard (GET shows form, POST saves) ---
+    // --- Login (POST: verify password → set session cookie) ---
+    if (url.pathname === "/login") {
+      if (request.method === "POST") return await handleLogin(request, env, cfg);
+      return redirect("/setup");
+    }
+
+    // --- Logout (clear session cookie) ---
+    if (url.pathname === "/logout") {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/setup", "Set-Cookie": clearSessionCookie() },
+      });
+    }
+
+    // --- Setup dashboard (login-gated; GET shows panel, POST saves) ---
     if (url.pathname === "/setup") {
-      if (request.method === "POST") return await saveSetup(request, env);
+      if (!(await isAuthed(request, cfg))) return html(loginPage(cfg, url));
+      if (request.method === "POST") return await saveSetup(request, env, cfg);
       return html(setupPage(cfg, url));
     }
 
@@ -73,8 +88,9 @@ export default {
       return new Response("ok");
     }
 
-    // --- One-click webhook registration (visit once after setup) ---
+    // --- One-click webhook registration (login-gated) ---
     if (url.pathname === "/register" && cfg.configured) {
+      if (!(await isAuthed(request, cfg))) return html(loginPage(cfg, url));
       const workerUrl = `${url.protocol}//${url.host}/webhook`;
       const r = await fetch(
         `https://api.telegram.org/bot${cfg.telegramToken}/setWebhook`,
@@ -102,46 +118,180 @@ async function loadConfig(env) {
   const raw = await env.BOT_DB.get("config");
   const c = raw ? JSON.parse(raw) : {};
   return {
+    raw: c,                                     // untouched stored object (for merge-on-save)
     configured: !!(c.telegramToken && c.openrouterKey),
     telegramToken: c.telegramToken || "",
     openrouterKey: c.openrouterKey || "",
     webhookSecret: c.webhookSecret || "",
     systemPrompt: c.systemPrompt || DEFAULT_SYSTEM_PROMPT,
     models: c.models && c.models.length ? c.models : DEFAULT_MODELS,
-    adminPassword: c.adminPassword || "admin",
+    // Auth: pwHash/pwSalt are the new format; adminPassword is the legacy plaintext.
+    pwHash: c.pwHash || "",
+    pwSalt: c.pwSalt || "",
+    adminPassword: c.adminPassword || (c.pwHash ? "" : "admin"),
+    // Server-side secret used to sign session cookies. Generated on first login.
+    sessionSecret: c.sessionSecret || "",
   };
 }
 
-async function saveSetup(request, env) {
+// Merge-on-save: only overwrite fields the admin actually provided. Blank
+// inputs keep their existing stored value, so the panel never loses data.
+async function saveSetup(request, env, cfg) {
   const form = await request.formData();
-  const cfg = await loadConfig(env);
+  const next = { ...cfg.raw };  // start from exactly what's in KV
 
-  // Simple password gate so randoms can't overwrite your config
-  if ((form.get("password") || "") !== cfg.adminPassword) {
-    return html(resultPage("❌ Wrong admin password."));
+  const setIfFilled = (key, formField) => {
+    const v = (form.get(formField) || "").trim();
+    if (v) next[key] = v;
+  };
+
+  setIfFilled("telegramToken", "telegramToken");
+  setIfFilled("openrouterKey", "openrouterKey");
+  setIfFilled("webhookSecret", "webhookSecret");
+
+  // System prompt: a checkbox lets the admin explicitly reset to default.
+  if (form.get("resetPrompt")) {
+    next.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+  } else {
+    const sp = (form.get("systemPrompt") || "").trim();
+    if (sp) next.systemPrompt = sp;
   }
 
+  // Models: only replace the list if the textarea is non-empty.
   const modelsText = (form.get("models") || "").trim();
-  const models = modelsText
-    ? modelsText.split("\n").map((line) => {
-        const id = line.trim();
-        return { id, label: id };
-      }).filter((m) => m.id)
-    : cfg.models;
+  if (modelsText) {
+    next.models = modelsText.split("\n")
+      .map((line) => ({ id: line.trim(), label: line.trim() }))
+      .filter((m) => m.id);
+  }
 
-  const next = {
-    telegramToken: (form.get("telegramToken") || "").trim(),
-    openrouterKey: (form.get("openrouterKey") || "").trim(),
-    webhookSecret: (form.get("webhookSecret") || "").trim() || crypto.randomUUID(),
-    systemPrompt: (form.get("systemPrompt") || "").trim() || DEFAULT_SYSTEM_PROMPT,
-    adminPassword: (form.get("newPassword") || "").trim() || cfg.adminPassword,
-    models,
-  };
+  // Ensure long-lived secrets exist.
+  if (!next.webhookSecret) next.webhookSecret = crypto.randomUUID();
+  if (!next.sessionSecret) next.sessionSecret = crypto.randomUUID();
+
+  // --- Change password (optional) ---
+  const newPw = (form.get("newPassword") || "").trim();
+  if (newPw) {
+    const confirm = (form.get("confirmPassword") || "").trim();
+    if (newPw !== confirm) {
+      return html(resultPage("❌ New password and confirmation don't match. Nothing was saved."));
+    }
+    if (newPw.length < 6) {
+      return html(resultPage("❌ New password must be at least 6 characters. Nothing was saved."));
+    }
+    const salt = crypto.randomUUID();
+    next.pwSalt = salt;
+    next.pwHash = await hashPassword(newPw, salt);
+    delete next.adminPassword;   // drop legacy plaintext once a hash exists
+  }
 
   await env.BOT_DB.put("config", JSON.stringify(next));
   return html(resultPage(
-    "✅ Saved! Next step: <a href='/register'>click here to register the Telegram webhook</a>, " +
-    "then message your bot."));
+    "✅ Saved." + (newPw ? " Password updated." : "") +
+    " Next: <a href='/register'>register the Telegram webhook</a>, then message your bot." +
+    " &nbsp;<a href='/setup'>← back to panel</a>"));
+}
+
+// ===========================================================================
+//  Auth — password hashing (PBKDF2) + signed session cookies (HMAC)
+// ===========================================================================
+const enc = new TextEncoder();
+const SESSION_TTL = 60 * 60 * 12;  // 12 hours
+
+async function hashPassword(password, salt) {
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: enc.encode(salt), iterations: 100000, hash: "SHA-256" },
+    key, 256,
+  );
+  return bufToHex(bits);
+}
+
+// Verify a password against stored config, supporting legacy plaintext.
+async function verifyPassword(cfg, password) {
+  if (cfg.pwHash && cfg.pwSalt) {
+    const candidate = await hashPassword(password, cfg.pwSalt);
+    return timingSafeEqual(candidate, cfg.pwHash);
+  }
+  // Legacy: plaintext compare (constant-time).
+  return timingSafeEqual(password, cfg.adminPassword || "admin");
+}
+
+async function handleLogin(request, env, cfg) {
+  const form = await request.formData();
+  const password = (form.get("password") || "").trim();
+  if (!(await verifyPassword(cfg, password))) {
+    return html(loginPage(cfg, new URL(request.url), "❌ Wrong password."), 401);
+  }
+  // First successful login with no session secret yet → generate & persist one.
+  let secret = cfg.sessionSecret;
+  if (!secret) {
+    secret = crypto.randomUUID();
+    await env.BOT_DB.put("config", JSON.stringify({ ...cfg.raw, sessionSecret: secret }));
+  }
+  const cookie = await makeSessionCookie(secret);
+  return new Response(null, { status: 302, headers: { Location: "/setup", "Set-Cookie": cookie } });
+}
+
+async function isAuthed(request, cfg) {
+  if (!cfg.sessionSecret) return false;
+  const token = readCookie(request, "session");
+  if (!token) return false;
+  return verifySessionToken(token, cfg.sessionSecret);
+}
+
+async function makeSessionCookie(secret) {
+  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+  const payload = `${exp}`;
+  const sig = await hmac(secret, payload);
+  return `session=${payload}.${sig}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}`;
+}
+
+function clearSessionCookie() {
+  return "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
+}
+
+async function verifySessionToken(token, secret) {
+  const dot = token.lastIndexOf(".");
+  if (dot < 0) return false;
+  const payload = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = await hmac(secret, payload);
+  if (!timingSafeEqual(sig, expected)) return false;
+  const exp = parseInt(payload, 10);
+  return Number.isFinite(exp) && exp > Math.floor(Date.now() / 1000);
+}
+
+async function hmac(secret, data) {
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return bufToHex(sig);
+}
+
+function readCookie(request, name) {
+  const header = request.headers.get("Cookie") || "";
+  for (const part of header.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k === name) return v.join("=");
+  }
+  return null;
+}
+
+function timingSafeEqual(a, b) {
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function bufToHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function redirect(location) {
+  return new Response(null, { status: 302, headers: { Location: location } });
 }
 
 // ===========================================================================
@@ -317,6 +467,11 @@ const STYLE = `
   .ok{background:#1f3a1f;color:#7ee787}.warn{background:#3a2f1f;color:#f0c674}
   code{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:13px}
   ol{padding-left:20px}ol li{margin:6px 0}
+  .err{background:#3a1f1f;color:#f0a0a0;padding:10px 13px;border-radius:9px;margin:0 0 16px;font-size:14px}
+  .topbar{display:flex;justify-content:space-between;align-items:center}
+  .topbar a{font-size:13px;font-weight:600}
+  .chk{display:flex;align-items:center;gap:8px;margin:14px 0 0;font-weight:400;font-size:13px;color:var(--muted)}
+  .chk input{width:auto;margin:0}
 `;
 
 function shell(inner) {
@@ -345,48 +500,75 @@ function landingPage(cfg, url) {
     </div>`);
 }
 
-function setupPage(cfg, url) {
-  const modelLines = cfg.models.map((m) => m.id).join("\n");
+function loginPage(cfg, url, error = "") {
+  const firstRun = !cfg.pwHash && (!cfg.adminPassword || cfg.adminPassword === "admin");
   return shell(`
     <div class="card">
-      <h1>⚙️ Setup</h1>
-      <p class="sub">Saved securely in your Cloudflare KV. Leave the password fields' defaults if unsure.</p>
-      <form method="POST" action="/setup">
-        <label>Admin password
-          <div class="hint">Default is <code>admin</code>. Change it below after first save.</div>
+      <h1>🔐 Admin login</h1>
+      <p class="sub">Enter the admin password to open the panel.</p>
+      ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      <form method="POST" action="/login">
+        <label>Password
+          ${firstRun ? `<div class="hint">Default password is <code>admin</code> — change it inside the panel right after logging in.</div>` : ""}
         </label>
-        <input name="password" type="password" placeholder="admin" required>
+        <input name="password" type="password" placeholder="••••••••" autofocus required>
+        <button type="submit">Log in →</button>
+      </form>
+    </div>`);
+}
 
+function setupPage(cfg, url) {
+  const modelLines = cfg.models.map((m) => m.id).join("\n");
+  const hasPrompt = !!cfg.raw.systemPrompt;
+  // Mask stored secrets: leave the field blank so a blank save keeps the
+  // existing value (merge-on-save). Filling it overwrites.
+  const mask = (v) => v ? "•••••• (saved — leave blank to keep)" : "";
+  return shell(`
+    <div class="card">
+      <div class="topbar">
+        <h1>⚙️ Panel</h1>
+        <a href="/logout">Log out</a>
+      </div>
+      <p class="sub">Saved securely in your Cloudflare KV. Blank fields keep their current value — your data is never wiped on save.</p>
+      <form method="POST" action="/setup">
         <h2>Required</h2>
         <label>Telegram Bot Token
-          <div class="hint">From @BotFather → /newbot</div>
+          <div class="hint">From @BotFather → /newbot. ${cfg.telegramToken ? "Already saved — leave blank to keep." : "Required."}</div>
         </label>
-        <input name="telegramToken" value="${esc(cfg.telegramToken)}" placeholder="123456:ABC-DEF...">
+        <input name="telegramToken" type="password" placeholder="${esc(mask(cfg.telegramToken)) || "123456:ABC-DEF..."}">
 
         <label>OpenRouter API Key
-          <div class="hint">From openrouter.ai → Keys. Free models work with $0 balance.</div>
+          <div class="hint">From openrouter.ai → Keys. ${cfg.openrouterKey ? "Already saved — leave blank to keep." : "Free models work with $0 balance."}</div>
         </label>
-        <input name="openrouterKey" value="${esc(cfg.openrouterKey)}" placeholder="sk-or-v1-...">
+        <input name="openrouterKey" type="password" placeholder="${esc(mask(cfg.openrouterKey)) || "sk-or-v1-..."}">
 
         <h2>Optional</h2>
         <label>Webhook secret
-          <div class="hint">Leave blank to auto-generate a secure random one.</div>
+          <div class="hint">${cfg.webhookSecret ? "Already set — leave blank to keep." : "Leave blank to auto-generate."}</div>
         </label>
-        <input name="webhookSecret" value="${esc(cfg.webhookSecret)}" placeholder="(auto)">
+        <input name="webhookSecret" type="password" placeholder="${esc(mask(cfg.webhookSecret)) || "(auto)"}">
 
         <label>System prompt (bot personality)</label>
-        <textarea name="systemPrompt" rows="3">${esc(cfg.systemPrompt)}</textarea>
+        <textarea name="systemPrompt" rows="3">${esc(hasPrompt ? cfg.systemPrompt : "")}</textarea>
+        <label class="chk"><input type="checkbox" name="resetPrompt" value="1"> Reset to the built-in default prompt</label>
+        ${hasPrompt ? "" : `<div class="hint">Currently using the built-in default. Type here to override.</div>`}
 
         <label>Model list (one OpenRouter model ID per line, first = default)
-          <div class="hint">Find free models at openrouter.ai/collections/free-models</div>
+          <div class="hint">Find free models at openrouter.ai/collections/free-models. Leave blank to keep the current list.</div>
         </label>
         <textarea name="models" rows="8">${esc(modelLines)}</textarea>
 
-        <label>New admin password (optional)</label>
-        <input name="newPassword" type="password" placeholder="(leave blank to keep current)">
+        <h2>Change password</h2>
+        <label>New password
+          <div class="hint">Min 6 characters. Leave blank to keep your current password.</div>
+        </label>
+        <input name="newPassword" type="password" placeholder="(leave blank to keep current)" autocomplete="new-password">
+        <label>Confirm new password</label>
+        <input name="confirmPassword" type="password" placeholder="(repeat the new password)" autocomplete="new-password">
 
-        <button type="submit">💾 Save configuration</button>
+        <button type="submit">💾 Save changes</button>
       </form>
+      <p class="hint" style="margin-top:20px"><a href="/register">Re-register the Telegram webhook</a></p>
     </div>`);
 }
 
